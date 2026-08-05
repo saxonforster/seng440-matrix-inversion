@@ -450,7 +450,7 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
                 continue;
             }
 
-            for (column = 0; column < N; column += 2) {
+            for (column = 0; column < N; column++) {
                 /*
                  * working[other_row][column] =
                  *     working[other_row][column]
@@ -479,29 +479,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
                 }
 
                 inverse[other_row][column] = (int16_t)updated_value;
-
-                /*
-                 * Process column + 1.
-                 */
-                product = fixed_multiply(elimination_factor, working[pivot_column][column + 1]);
-
-                updated_value = (int32_t)working[other_row][column + 1] - product;
-
-                if (!fixed_result_fits_int16(updated_value)) {
-                    return MATRIX_OVERFLOW;
-                }
-
-                working[other_row][column + 1] = (int16_t)updated_value;
-
-                product = fixed_multiply(elimination_factor, inverse[pivot_column][column + 1]);
-
-                updated_value = (int32_t)inverse[other_row][column + 1] - product;
-
-                if (!fixed_result_fits_int16(updated_value)) {
-                    return MATRIX_OVERFLOW;
-                }
-
-                inverse[other_row][column + 1] = (int16_t)updated_value;
             }
 
             /*
