@@ -90,10 +90,10 @@ int fixed_result_fits_int16(int32_t value)
 int32_t fixed_multiply(int16_t first, int16_t second)
 {
     int32_t product;
+    int32_t magnitude;
 
     /*
      * int16_t operands are promoted to int32_t.
-     *
      * The largest possible magnitude is approximately:
      *
      *     32768 * 32768 = 1,073,741,824
@@ -106,12 +106,13 @@ int32_t fixed_multiply(int16_t first, int16_t second)
      * Apply simple rounding before removing the extra scale factor.
      */
     if (product >= 0) {
-        product = product + (FIXED_ONE / 2);
-    } else {
-        product = product - (FIXED_ONE / 2);
+        return (product + (1 << (FRACTION_BITS - 1)))
+            >> FRACTION_BITS;
     }
 
-    return product / FIXED_ONE;
+    magnitude = -product;
+
+    return -((magnitude + (1 << (FRACTION_BITS - 1))) >> FRACTION_BITS);
 }
 
 /*
@@ -132,27 +133,47 @@ int fixed_divide(int16_t numerator, int16_t denominator, int32_t *result)
     int32_t scaled_numerator;
     int32_t denominator_32;
     int32_t half_denominator;
+    int32_t denominator_magnitude;
+    int32_t numerator_magnitude;
 
     if (denominator == 0) {
         return 0;
     }
 
-    /*
-     * Multiplication is used instead of left-shifting because
-     * left-shifting a negative signed value is undefined in C.
-     */
-    scaled_numerator = (int32_t)numerator * FIXED_ONE;
+    /* Algebraic fast paths avoid an integer divide entirely. */
+    if (numerator == 0) {
+        *result = 0;
+        return 1;
+    }
+
+    if (denominator == FIXED_ONE) {
+        *result = numerator;
+        return 1;
+    }
+
+    if (denominator == -FIXED_ONE) {
+        *result = -(int32_t)numerator;
+        return 1;
+    }
 
     denominator_32 = denominator;
 
-    /*
-     * Apply rounding before integer division.
-     */
-    if (denominator_32 < 0) {
-        half_denominator = -denominator_32 / 2;
+    // Operator strength reduction --> was: scaled_numerator = (int32_t)numerator * FIXED_ONE;
+    if (numerator < 0) {
+        numerator_magnitude = -(int32_t)numerator;
+        scaled_numerator = -(numerator_magnitude << FRACTION_BITS);
     } else {
-        half_denominator = denominator_32 / 2;
+        scaled_numerator = (int32_t)numerator << FRACTION_BITS;
     }
+
+    // Operator strength reduction --> was: half_denominator = denominator_32 / 2;
+    if (denominator_32 < 0) {
+        denominator_magnitude = -denominator_32;
+    } else {
+        denominator_magnitude = denominator_32;
+    }
+
+    half_denominator = denominator_magnitude >> 1;
 
     if ((scaled_numerator >= 0 && denominator_32 > 0) || (scaled_numerator < 0 && denominator_32 < 0)) {
         scaled_numerator += half_denominator;
@@ -380,15 +401,19 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
             /*
              * Normalize the working-matrix element.
              */
-            if (!fixed_divide(working[pivot_column][column], pivot_value, &division_result)) {
-                return MATRIX_SINGULAR;
-            }
+            if (column == pivot_column) {
+                working[pivot_column][column] = FIXED_ONE;
+            } else {
+                if (!fixed_divide(working[pivot_column][column], pivot_value, &division_result)) {
+                    return MATRIX_SINGULAR;
+                }
 
-            if (!fixed_result_fits_int16(division_result)) {
-                return MATRIX_OVERFLOW;
-            }
+                if (!fixed_result_fits_int16(division_result)) {
+                    return MATRIX_OVERFLOW;
+                }
 
-            working[pivot_column][column] = (int16_t)division_result;
+                working[pivot_column][column] = (int16_t)division_result;
+            }
 
             /*
              * Apply the same division to the inverse side.
@@ -403,15 +428,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
 
             inverse[pivot_column][column] = (int16_t)division_result;
         }
-
-        /*
-         * Force the pivot to exactly 1.0 in Q4.12.
-         *
-         * The division above should already produce 4096, but
-         * explicitly setting it avoids retaining a possible
-         * one-unit rounding difference.
-         */
-        working[pivot_column][pivot_column] = FIXED_ONE;
 
         /*
          * Eliminate the pivot-column value from every other row.
@@ -564,10 +580,8 @@ int multiply_positive_q12(int32_t first, int32_t second, int32_t *result)
 
     product = first * second;
 
-    /*
-     * Both operands are Q4.12, so remove one scale factor.
-     */
-    *result = product / FIXED_ONE;
+    // Operator strength reduction --> was: *result = product / FIXED_ONE;
+    *result = product >> FRACTION_BITS;
 
     return 1;
 }
