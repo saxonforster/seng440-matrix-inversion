@@ -1,29 +1,32 @@
 /*
- * matrix_inverse_fixed.c
+ * matrix_neon_operator_strength_reduction.c
  *
- * Unoptimized 8x8 matrix inversion using Gauss-Jordan elimination
- * with partial pivoting.
+ * 8x8 matrix inversion by Gauss-Jordan elimination with partial
+ * pivoting, using signed 16-bit Q4.12 fixed-point arithmetic.
  *
- * All stored matrix elements use signed 16-bit Q4.12 fixed-point.
+ * COMBINED OPTIMIZATIONS:
  *
- * Q4.12:
- *   Scale factor: 2^12 = 4096
- *   Real range:   -8.0 to approximately 7.999755859375
+ * 1. NEON SIMD
+ *    The row-elimination operation processes eight int16_t matrix
+ *    elements in parallel using 128-bit NEON vector registers.
+ *    Element-by-element overflow tests are replaced by one range
+ *    test after each pair of vector row operations.
  *
- * This is intended to be the pure-software integer baseline.
- * It does not use NEON, CLZ, loop unrolling, custom instructions,
- * floating-point arithmetic, or 64-bit integers.
+ * 2. Operator strength reduction
+ *    Constant multiplication and division by powers of two are
+ *    replaced with shifts where this preserves correctness.
+ *    Algebraically known division cases are handled without an
+ *    integer division, and pivot/pivot is assigned directly as
+ *    Q4.12 one.
+ *
+ * No CLZ, reciprocal approximation, loop unrolling, floating-point
+ * matrix arithmetic, or 64-bit integer arithmetic is used.
  */
-
-#define _POSIX_C_SOURCE 199309L
 
 #include <stdio.h>
 #include <stdint.h>
 #include <limits.h>
-#include <time.h>
-
-#define BENCHMARK_ITERATIONS 100000
-#define WARMUP_ITERATIONS 1000
+#include <arm_neon.h>
 
 #define N 8
 
@@ -94,6 +97,7 @@ int32_t fixed_multiply(int16_t first, int16_t second)
 
     /*
      * int16_t operands are promoted to int32_t.
+     *
      * The largest possible magnitude is approximately:
      *
      *     32768 * 32768 = 1,073,741,824
@@ -187,90 +191,6 @@ int fixed_divide(int16_t numerator, int16_t denominator, int32_t *result)
 }
 
 /*
- * Prints one Q4.12 value without float, double, or int64_t.
- *
- * Decimal digits are generated one at a time to avoid overflowing
- * int32_t when converting the fractional part.
- */
-void print_fixed_value(int32_t value)
-{
-    int32_t magnitude;  
-    int32_t whole_part;
-    int32_t remainder;
-    int digit;
-    int position;
-
-    // Print the sign first.
-    if (value < 0) {
-        magnitude = -value;
-    } else {
-        magnitude = value;
-    }
-
-    // Extract the whole-number portion.
-    whole_part = magnitude / FIXED_ONE;
-
-    // Keep the remaining Q4.12 fractional portion.
-    remainder = magnitude % FIXED_ONE;
-
-    // Print the sign and whole part together 
-    if (value < 0) {
-        printf("-%ld.", (long)whole_part);
-    } else {
-        printf(" %ld.", (long)whole_part);
-    }                                 
-
-    // Generate six decimal digits.
-    // The remainder is always less than 4096, so multiplying it by 10 stays safely within int32_t.
-    for (position = 0; position < 6; position++) {
-        remainder = remainder * 10;
-        digit = (int)(remainder / FIXED_ONE);
-        printf("%d", digit);
-        remainder = remainder % FIXED_ONE;
-    }
-}
-
-
-/*
- * Prints an 8x8 int16_t Q4.12 matrix.
- */
-void print_matrix(const int16_t matrix[N][N])
-{
-    int row;
-    int column;
-
-    for (row = 0; row < N; row++) {
-        for (column = 0; column < N; column++) {
-            print_fixed_value(matrix[row][column]);
-            printf(" ");
-        }
-
-        printf("\n");
-    }
-}
-
-/*
- * Prints an 8x8 int32_t Q4.12 matrix.
- *
- * This is used for the verification result because a sum of eight
- * products may temporarily require more than 16 bits.
- */
-void print_wide_matrix(const int32_t matrix[N][N])
-{
-    int row;
-    int column;
-
-    for (row = 0; row < N; row++) {
-        for (column = 0; column < N; column++) {
-            print_fixed_value(matrix[row][column]);
-            printf(" ");
-        }
-
-        printf("\n");
-    }
-}
-
-/*
  * Creates an 8x8 Q4.12 identity matrix.
  *
  * The fixed-point representation of 1.0 is 4096.
@@ -307,6 +227,98 @@ void swap_rows(int16_t matrix[N][N], int row1, int row2)
 }
 
 /*
+ * ===================== CHANGE B: NEON kernels =====================
+ *
+ * The elimination step for one row is, for c = 0..7:
+ *
+ *     target[c] = target[c] - (factor * source[c] + 2048) / 4096
+ *
+ * Eight independent lanes of 16-bit data. One NEON register is 128
+ * bits, so the whole row is one vector pass.
+ *
+ * Intrinsics used and the Cortex-A7 instructions they generate:
+ *
+ *   vld1q_s16     VLD1.16    load 8 int16 lanes
+ *   vst1q_s16     VST1.16    store 8 int16 lanes
+ *   vmull_n_s16   VMULL.S16  widening multiply by a scalar, 4x 16->32
+ *   vmovl_s16     VMOVL.S16  widen 16 -> 32
+ *   vmovn_s32     VMOVN.I32  narrow 32 -> 16
+ *   vsubq_s32     VSUB.I32   subtract
+ *   veorq_s32     VEOR       exclusive or
+ *   vshrq_n_s32   VSHR.S32   arithmetic shift right
+ *   vrshrq_n_s32  VRSHR.S32  ROUNDING shift right
+ *   vorrq_u32     VORR       bitwise or
+ *
+ * Note vrshrq_n_s32. The baseline's '+ 2048 then divide by 4096' is a
+ * rounding shift, and NEON does the rounding inside the shift
+ * instruction, so that whole add disappears in the vector version.
+ */
+
+/*
+ * (product + 2048) / 4096 with round-half-away-from-zero, four lanes
+ * at a time. This must match the baseline fixed_multiply() exactly.
+ *
+ * VRSHR rounds by adding half and shifting arithmetically, which for a
+ * negative value rounds toward positive infinity rather than away from
+ * zero. So the sign is stripped, the rounding shift applied to the
+ * magnitude, and the sign put back:
+ *
+ *     sign = p >> 31            0 for positive, all-ones for negative
+ *     |p|  = (p ^ sign) - sign  branch-free absolute value
+ *
+ * The four extra instructions buy output that is bit-identical to the
+ * baseline, which makes verification a plain diff against it.
+ */
+static inline int32x4_t neon_q12_round_shift(int32x4_t product)
+{
+    int32x4_t sign      = vshrq_n_s32(product, 31);
+    int32x4_t magnitude = vsubq_s32(veorq_s32(product, sign), sign);
+    int32x4_t shifted   = vrshrq_n_s32(magnitude, FRACTION_BITS);
+
+    return vsubq_s32(veorq_s32(shifted, sign), sign);
+}
+
+/*
+ * One row of elimination:
+ *
+ *     target[0..7] -= (factor * source[0..7]) / 4096
+ *
+ * Each result is folded to its magnitude and ORed into the
+ * accumulator, so the caller can range-check all eight lanes with one
+ * comparison after the row instead of one per element.
+ */
+static inline void neon_eliminate_row(int16_t *target, const int16_t *source,
+                                      int16_t factor, uint32x4_t *accumulator)
+{
+    int16x8_t source_vector = vld1q_s16(source);
+    int16x8_t target_vector = vld1q_s16(target);
+
+    int32x4_t product_low  = vmull_n_s16(vget_low_s16(source_vector),  factor);
+    int32x4_t product_high = vmull_n_s16(vget_high_s16(source_vector), factor);
+
+    int32x4_t difference_low;
+    int32x4_t difference_high;
+
+    product_low  = neon_q12_round_shift(product_low);
+    product_high = neon_q12_round_shift(product_high);
+
+    difference_low  = vsubq_s32(vmovl_s16(vget_low_s16(target_vector)),
+                                product_low);
+    difference_high = vsubq_s32(vmovl_s16(vget_high_s16(target_vector)),
+                                product_high);
+
+    *accumulator = vorrq_u32(*accumulator,
+        vreinterpretq_u32_s32(veorq_s32(difference_low,
+                                        vshrq_n_s32(difference_low, 31))));
+    *accumulator = vorrq_u32(*accumulator,
+        vreinterpretq_u32_s32(veorq_s32(difference_high,
+                                        vshrq_n_s32(difference_high, 31))));
+
+    vst1q_s16(target, vcombine_s16(vmovn_s32(difference_low),
+                                   vmovn_s32(difference_high)));
+}
+
+/*
  * Inverts an 8x8 Q4.12 matrix using Gauss-Jordan elimination
  * with partial pivoting.
  *
@@ -334,11 +346,20 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
     int32_t largest_value;
     int32_t current_value;
     int32_t division_result;
-    int32_t product;
-    int32_t updated_value;
 
     int16_t pivot_value;
     int16_t elimination_factor;
+
+    /*
+     * CHANGE A: OR of the folded magnitudes of every result in a row.
+     *
+     * For any value v, (v ^ (v >> 31)) is v's magnitude for positive v
+     * and |v| - 1 for negative v, and v fits in int16_t exactly when
+     * that is <= 32767. ORing them means the widest element sets the
+     * highest bit, so if the OR fits then every element that produced
+     * it fits. One comparison per row replaces 2N of them.
+     */
+    uint32_t range_accumulator;
 
     /*
      * Copy the input matrix so that the original is preserved.
@@ -450,35 +471,33 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
                 continue;
             }
 
-            for (column = 0; column < N; column++) {
+            {
                 /*
-                 * working[other_row][column] =
-                 *     working[other_row][column]
-                 *     - elimination_factor
-                 *     * working[pivot_column][column]
+                 * CHANGE B: two vector row operations replace the
+                 * 2 * N scalar iterations of the baseline.
                  */
-                product = fixed_multiply(elimination_factor, working[pivot_column][column]);
+                uint32x4_t vector_accumulator = vdupq_n_u32(0);
 
-                updated_value = (int32_t)working[other_row][column] - product;
+                neon_eliminate_row(working[other_row], working[pivot_column], elimination_factor, &vector_accumulator);
 
-                if (!fixed_result_fits_int16(updated_value)) {
-                    return MATRIX_OVERFLOW;
-                }
+                neon_eliminate_row(inverse[other_row], inverse[pivot_column], elimination_factor, &vector_accumulator);
 
-                working[other_row][column] = (int16_t)updated_value;
+                range_accumulator =
+                      vgetq_lane_u32(vector_accumulator, 0)
+                    | vgetq_lane_u32(vector_accumulator, 1)
+                    | vgetq_lane_u32(vector_accumulator, 2)
+                    | vgetq_lane_u32(vector_accumulator, 3);
+            }
 
-                /*
-                 * Perform the same operation on the inverse.
-                 */
-                product = fixed_multiply(elimination_factor, inverse[pivot_column][column]);
-
-                updated_value = (int32_t)inverse[other_row][column] - product;
-
-                if (!fixed_result_fits_int16(updated_value)) {
-                    return MATRIX_OVERFLOW;
-                }
-
-                inverse[other_row][column] = (int16_t)updated_value;
+            /*
+             * CHANGE A: one range test for the whole row.
+             *
+             * No CLZ needed -- a plain comparison against INT16_MAX is
+             * enough, because the accumulator already holds folded
+             * magnitudes.
+             */
+            if (range_accumulator > (uint32_t)INT16_MAX) {
+                return MATRIX_OVERFLOW;
             }
 
             /*
@@ -580,7 +599,7 @@ int multiply_positive_q12(int32_t first, int32_t second, int32_t *result)
 
     product = first * second;
 
-    // Operator strength reduction --> was: *result = product / FIXED_ONE;
+   // Operator strength reduction --> was: *result = product / FIXED_ONE;
     *result = product >> FRACTION_BITS;
 
     return 1;
@@ -607,257 +626,4 @@ int calculate_condition_number(const int16_t matrix[N][N], const int16_t inverse
     inverse_norm = matrix_infinity_norm(inverse);
 
     return multiply_positive_q12(matrix_norm, inverse_norm, condition_number);
-}
-
-
-/*
- * Returns elapsed wall-clock time in seconds.
- *
- * Floating point is used only by the benchmark harness. The matrix
- * inversion itself remains entirely fixed-point.
- */
-static double elapsed_seconds(
-    const struct timespec *start,
-    const struct timespec *end)
-{
-    return (double)(end->tv_sec - start->tv_sec)
-         + (double)(end->tv_nsec - start->tv_nsec)
-           / 1000000000.0;
-}
-
-
-int main(void)
-{
-    /*
-     * Example Q4.12 8x8 matrix.
-     *
-     * This matrix uses 4 on the diagonal and 1 beside the
-     * diagonal. Every value is representable in Q4.12.
-     *
-     * The previous floating-point example used 10 on the
-     * diagonal, but 10 is outside the Q4.12 range.
-     */
-    int16_t matrix[N][N] = {
-        {
-            Q12_FROM_INT(4), Q12_FROM_INT(1),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0)
-        },
-        {
-            Q12_FROM_INT(1), Q12_FROM_INT(4),
-            Q12_FROM_INT(1), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0)
-        },
-        {
-            Q12_FROM_INT(0), Q12_FROM_INT(1),
-            Q12_FROM_INT(4), Q12_FROM_INT(1),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0)
-        },
-        {
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(1), Q12_FROM_INT(4),
-            Q12_FROM_INT(1), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0)
-        },
-        {
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(1),
-            Q12_FROM_INT(4), Q12_FROM_INT(1),
-            Q12_FROM_INT(0), Q12_FROM_INT(0)
-        },
-        {
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(1), Q12_FROM_INT(4),
-            Q12_FROM_INT(1), Q12_FROM_INT(0)
-        },
-        {
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(1),
-            Q12_FROM_INT(4), Q12_FROM_INT(1)
-        },
-        {
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(0), Q12_FROM_INT(0),
-            Q12_FROM_INT(1), Q12_FROM_INT(4)
-        }
-    };
-
-    int16_t inverse[N][N];
-    int32_t verification[N][N];
-
-    int32_t condition_number;
-    int inversion_status;
-
-    struct timespec start_time;
-    struct timespec end_time;
-
-    double total_seconds;
-    double average_nanoseconds;
-    int iteration;
-
-     /*
-     * Correctness check before benchmarking.
-     *
-     * This is outside the timed region.
-     */
-    inversion_status =
-        invert_matrix(matrix, inverse);
-
-    if (inversion_status == MATRIX_SINGULAR) {
-        printf(
-            "The matrix is singular, or no usable pivot "
-            "exists at Q4.12 precision.\n"
-        );
-
-        return 1;
-    }
-
-    if (inversion_status == MATRIX_OVERFLOW) {
-        printf(
-            "Q4.12 overflow occurred during inversion.\n"
-        );
-
-        return 1;
-    }
-
-    multiply_matrices(
-        matrix,
-        inverse,
-        verification
-    );
-
-    if (!calculate_condition_number(
-            matrix,
-            inverse,
-            &condition_number)) {
-
-        printf(
-            "The condition-number calculation exceeded "
-            "the available 32-bit range.\n"
-        );
-
-        return 1;
-    }
-
-    printf("Correctness check before benchmarking:\n");
-    printf(
-        "  inversion status: %d\n",
-        inversion_status
-    );
-    printf(
-        "  inverse[0][0]: %d\n",
-        inverse[0][0]
-    );
-    printf(
-        "  verification[0][0]: %ld\n",
-        (long)verification[0][0]
-    );
-    printf("  condition number: ");
-    print_fixed_value(condition_number);
-    printf("\n\n");
-
-    /*
-     * Warm-up iterations are not timed.
-     */
-    for (iteration = 0;
-         iteration < WARMUP_ITERATIONS;
-         iteration++) {
-
-        inversion_status =
-            invert_matrix(matrix, inverse);
-
-        if (inversion_status != MATRIX_SUCCESS) {
-            printf(
-                "Inversion failed during warm-up.\n"
-            );
-
-            return 1;
-        }
-    }
-
-    /*
-     * Begin the timed region.
-     */
-    if (clock_gettime(
-            CLOCK_MONOTONIC,
-            &start_time) != 0) {
-
-        perror("clock_gettime start");
-        return 1;
-    }
-
-    /*
-     * Only invert_matrix() is measured.
-     */
-    for (iteration = 0;
-         iteration < BENCHMARK_ITERATIONS;
-         iteration++) {
-
-        inversion_status =
-            invert_matrix(matrix, inverse);
-
-        if (inversion_status != MATRIX_SUCCESS) {
-            printf(
-                "Inversion failed during benchmark.\n"
-            );
-
-            return 1;
-        }
-    }
-
-    /*
-     * End the timed region.
-     */
-    if (clock_gettime(
-            CLOCK_MONOTONIC,
-            &end_time) != 0) {
-
-        perror("clock_gettime end");
-        return 1;
-    }
-
-    total_seconds =
-        elapsed_seconds(
-            &start_time,
-            &end_time
-        );
-
-    average_nanoseconds =
-        total_seconds
-        * 1000000000.0
-        / BENCHMARK_ITERATIONS;
-
-    printf("Optimized fixed-point benchmark:\n");
-    printf(
-        "  warm-up iterations: %d\n",
-        WARMUP_ITERATIONS
-    );
-    printf(
-        "  measured iterations: %d\n",
-        BENCHMARK_ITERATIONS
-    );
-    printf(
-        "  total measured time: %.9f seconds\n",
-        total_seconds
-    );
-    printf(
-        "  average time per inversion: %.2f ns\n",
-        average_nanoseconds
-    );
-
-    /*
-     * Keep one calculated result observable after the loop.
-     */
-    printf(
-        "  final result check inverse[0][0]: %d\n",
-        inverse[0][0]
-    );
-
-    return 0;
 }

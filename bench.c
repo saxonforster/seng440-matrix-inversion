@@ -1,3 +1,4 @@
+#include <stdio.h>
 /*
  * bench.c
  *
@@ -33,7 +34,6 @@
  * way so this one can take over. Nothing in the source needs editing.
  */
 
-#include <stdio.h>
 #include <stdint.h>
 
 #define N 8
