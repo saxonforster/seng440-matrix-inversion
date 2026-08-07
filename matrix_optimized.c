@@ -51,7 +51,7 @@
  * A 32-bit result is used because abs(-32768) is 32768, which
  * cannot be represented by int16_t.
  */
-int32_t fixed_absolute(int16_t value)
+static inline int32_t fixed_absolute(int16_t value)
 {
     int32_t widened_value;
 
@@ -67,7 +67,7 @@ int32_t fixed_absolute(int16_t value)
 /*
  * Checks whether a Q4.12 result can be stored in int16_t.
  */
-int fixed_result_fits_int16(int32_t value)
+static inline int fixed_result_fits_int16(int32_t value)
 {
     if (value < INT16_MIN || value > INT16_MAX) {
         return 0;
@@ -90,7 +90,7 @@ int fixed_result_fits_int16(int32_t value)
  * The returned value is int32_t so that the caller can check
  * whether it fits into int16_t before storing it.
  */
-int32_t fixed_multiply(int16_t first, int16_t second)
+static inline int32_t fixed_multiply(int16_t first, int16_t second)
 {
     int32_t product;
     int32_t magnitude;
@@ -132,7 +132,7 @@ int32_t fixed_multiply(int16_t first, int16_t second)
  *     1 when successful
  *     0 when the denominator is zero
  */
-int fixed_divide(int16_t numerator, int16_t denominator, int32_t *result)
+static inline int fixed_divide(int16_t numerator, int16_t denominator, int32_t *result)
 {
     int32_t scaled_numerator;
     int32_t denominator_32;
