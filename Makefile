@@ -1,143 +1,163 @@
-# SENG 440 - Matrix Inversion
-#
-#   not_optimized_fixedpoint.c   the baseline
-#   matrix_neon.c                baseline + hoisted range check + NEON
-#   bench.c                      profiling driver (no main() conflict)
-#
-#   make            build the demo programs
-#   make verify     prove NEON gives the same answer as the baseline
-#   make asm        confirm NEON instructions were emitted
-#   make check      diagnose missing profiling tools
-#   make counts     >>> instruction counts per inversion <<<
-#   make branches   branch counts and mispredicts
-#   make static     fallback if valgrind is unavailable
+CC = gcc
 
-CC     = gcc
-OPT    = -O2
-ARCH   = -march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
-CFLAGS = $(OPT) $(ARCH) -Wall -Wextra
+CFLAGS = -O2 -Wall -Wextra -std=c11
 
-# Inversions per profiling run. Raise for finer resolution; the
-# per-inversion figure is what gets reported either way.
-ITERS  = 1000
+ARM_FLAGS = -march=armv7-a \
+            -mtune=cortex-a7 \
+            -mfpu=neon-vfpv4 \
+            -mfloat-abi=hard
 
-all: matrix_baseline matrix_neon
+IMPLEMENTATIONS = baseline osr neon optimized
 
-matrix_baseline: not_optimized_fixedpoint.c
-	$(CC) $(CFLAGS) $< -o $@
+.PHONY: all demos timings benches run-demos run-timings \
+        counts clean
 
-matrix_neon: matrix_neon.c
-	$(CC) $(CFLAGS) $< -o $@
+all: demos timings benches
 
-# --------------------------------------------------------------------
-# Profiling builds.
-#
-# Compiled as separate objects on purpose. Without -flto the compiler
-# cannot inline across a translation-unit boundary, which guarantees
-# invert_matrix() stays a distinct symbol that callgrind can attribute
-# cost to. Built into main() it would be reported against main().
-#
-# -Dmain=program_main renames the demo main() out of the way so bench.c
-# can supply its own. Neither source file needs editing.
-# --------------------------------------------------------------------
-bench.o: bench.c
-	$(CC) $(CFLAGS) -DITERATIONS=$(ITERS) -c $< -o $@
 
-base_prof.o: not_optimized_fixedpoint.c
-	$(CC) $(CFLAGS) -Dmain=program_main -c $< -o $@
+# ============================================================
+# Printable demonstration programs
+# ============================================================
 
-neon_prof.o: matrix_neon.c
-	$(CC) $(CFLAGS) -Dmain=program_main -c $< -o $@
+demos: demo_baseline demo_osr demo_neon demo_optimized
 
-bench_baseline: base_prof.o bench.o
-	$(CC) $^ -o $@
+demo_baseline: demo.c not_optimized_fixedpoint.c
+	$(CC) $(CFLAGS) \
+		demo.c not_optimized_fixedpoint.c \
+		-o demo_baseline
 
-bench_neon: neon_prof.o bench.o
-	$(CC) $^ -o $@
+demo_osr: demo.c operator_strength_reduction.c
+	$(CC) $(CFLAGS) \
+		demo.c operator_strength_reduction.c \
+		-o demo_osr
 
-benches: bench_baseline bench_neon
+demo_neon: demo.c matrix_neon.c
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
+		demo.c matrix_neon.c \
+		-o demo_neon
 
-# --------------------------------------------------------------------
-# Correctness.
-# --------------------------------------------------------------------
-verify: matrix_baseline matrix_neon
-	@./matrix_baseline > baseline.txt
-	@./matrix_neon     > neon.txt
-	@if diff -q baseline.txt neon.txt > /dev/null; then \
-	  echo "PASS: NEON output is identical to the baseline"; \
-	else \
-	  echo "FAIL:"; diff baseline.txt neon.txt; \
-	fi
+demo_optimized: demo.c matrix_optimized.c
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
+		demo.c matrix_optimized.c \
+		-o demo_optimized
 
-# Both drivers must report the same success count and the same final
-# value. If they differ, they are not seeing the same input and any
-# comparison below is meaningless.
-verify-bench: benches
-	@echo "baseline:"; ./bench_baseline
-	@echo "neon:";     ./bench_neon
 
-# --------------------------------------------------------------------
-# Are the tools present?
-# --------------------------------------------------------------------
-check:
-	@echo -n "valgrind ............ "; \
-	  if command -v valgrind >/dev/null 2>&1; then valgrind --version; \
-	  else echo "MISSING  (apt-get install valgrind, or use 'make static')"; fi
-	@echo -n "callgrind_annotate .. "; \
-	  if command -v callgrind_annotate >/dev/null 2>&1; then echo present; \
-	  else echo "MISSING"; fi
-	@echo -n "objdump ............. "; \
-	  if command -v objdump >/dev/null 2>&1; then echo present; else echo MISSING; fi
+# ============================================================
+# Execution-time programs
+# ============================================================
 
-# --------------------------------------------------------------------
-# THE NUMBER FOR THE REPORT: instructions per inversion.
-#
-# Deterministic, unaffected by QEMU. Do not use wall-clock time from
-# inside the VM -- QEMU translates ARM to x86 without modelling the
-# Cortex-A7 pipeline, and it penalises NEON especially, because eight
-# lanes of real work become roughly eight times the host instructions.
-# --------------------------------------------------------------------
+timings: timing_baseline timing_osr timing_neon timing_optimized
+
+timing_baseline: timing.c not_optimized_fixedpoint.c
+	$(CC) $(CFLAGS) \
+		timing.c not_optimized_fixedpoint.c \
+		-o timing_baseline
+
+timing_osr: timing.c operator_strength_reduction.c
+	$(CC) $(CFLAGS) \
+		timing.c operator_strength_reduction.c \
+		-o timing_osr
+
+timing_neon: timing.c matrix_neon.c
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
+		timing.c matrix_neon.c \
+		-o timing_neon
+
+timing_optimized: timing.c matrix_optimized.c
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
+		timing.c matrix_optimized.c \
+		-o timing_optimized
+
+
+# ============================================================
+# Valgrind / Callgrind programs
+# ============================================================
+
+benches: bench_baseline bench_osr bench_neon bench_optimized
+
+bench_baseline: bench.c not_optimized_fixedpoint.c
+	$(CC) $(CFLAGS) \
+		bench.c not_optimized_fixedpoint.c \
+		-o bench_baseline
+
+bench_osr: bench.c operator_strength_reduction.c
+	$(CC) $(CFLAGS) \
+		bench.c operator_strength_reduction.c \
+		-o bench_osr
+
+bench_neon: bench.c matrix_neon.c
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
+		bench.c matrix_neon.c \
+		-o bench_neon
+
+bench_optimized: bench.c matrix_optimized.c
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
+		bench.c matrix_optimized.c \
+		-o bench_optimized
+
+
+# ============================================================
+# Run targets
+# ============================================================
+
+run-demos: demos
+	./demo_baseline
+	./demo_osr
+	./demo_neon
+	./demo_optimized
+
+run-timings: timings
+	./timing_baseline
+	./timing_osr
+	./timing_neon
+	./timing_optimized
+
+
+# ============================================================
+# Callgrind instruction-count tests
+# ============================================================
+
 counts: benches
-	@for s in bench_baseline bench_neon; do \
-	  valgrind --tool=callgrind --callgrind-out-file=cg.$$s ./$$s >/dev/null 2>&1 || \
-	    { echo "valgrind failed -- run 'make check'"; exit 1; }; \
-	  total=$$(callgrind_annotate cg.$$s 2>/dev/null \
-	           | grep -E '[0-9,]+ .*invert_matrix' | head -1 \
-	           | tr -d ',' | awk '{print $$1}'); \
-	  if [ -z "$$total" ]; then \
-	    echo "$$s: could not find invert_matrix -- raw output follows:"; \
-	    callgrind_annotate cg.$$s | head -25; \
-	  else \
-	    echo "$$s: $$total instructions total, $$((total / $(ITERS))) per inversion"; \
-	  fi; \
-	done
+	valgrind --tool=callgrind \
+		--callgrind-out-file=callgrind.baseline \
+		./bench_baseline
 
-branches: benches
-	@for s in bench_baseline bench_neon; do \
-	  echo "=== $$s ==="; \
-	  valgrind --tool=cachegrind --branch-sim=yes ./$$s 2>&1 >/dev/null \
-	    | grep -E 'Branches|Mispredicts|I *refs'; \
-	done
+	valgrind --tool=callgrind \
+		--callgrind-out-file=callgrind.osr \
+		./bench_osr
 
-# --------------------------------------------------------------------
-# Fallback if valgrind will not install. Static instruction counts are
-# weaker evidence -- they count instructions present, not executed --
-# but they do show the loop body shrinking.
-# --------------------------------------------------------------------
-static: benches
-	@for s in bench_baseline bench_neon; do \
-	  n=$$(objdump -d $$s | awk '/<invert_matrix>:/,/^$$/' | grep -cE '^\s+[0-9a-f]+:'); \
-	  echo "$$s: $$n static instructions in invert_matrix"; \
-	done
+	valgrind --tool=callgrind \
+		--callgrind-out-file=callgrind.neon \
+		./bench_neon
 
-asm: matrix_neon
-	@echo "VMULL:     $$(objdump -d matrix_neon | grep -c vmull)"
-	@echo "VRSHR:     $$(objdump -d matrix_neon | grep -c vrshr)"
-	@echo "VLD1/VST1: $$(objdump -d matrix_neon | grep -cE 'vld1|vst1')"
-	@echo "VSUB/VEOR: $$(objdump -d matrix_neon | grep -cE 'vsub|veor')"
+	valgrind --tool=callgrind \
+		--callgrind-out-file=callgrind.optimized \
+		./bench_optimized
+
+	callgrind_annotate callgrind.baseline
+	callgrind_annotate callgrind.osr
+	callgrind_annotate callgrind.neon
+	callgrind_annotate callgrind.optimized
+
+
+# ============================================================
+# Cleanup
+# ============================================================
 
 clean:
-	rm -f matrix_baseline matrix_neon bench_baseline bench_neon \
-	      *.o cg.* cachegrind.out.* baseline.txt neon.txt
+	rm -f demo_baseline
+	rm -f demo_osr
+	rm -f demo_neon
+	rm -f demo_optimized
 
-.PHONY: all benches verify verify-bench check counts branches static asm clean
+	rm -f timing_baseline
+	rm -f timing_osr
+	rm -f timing_neon
+	rm -f timing_optimized
+
+	rm -f bench_baseline
+	rm -f bench_osr
+	rm -f bench_neon
+	rm -f bench_optimized
+
+	rm -f callgrind.*
