@@ -2,8 +2,7 @@ CC = gcc
 
 CFLAGS = -O2 -Wall -Wextra -std=c11
 
-ARM_FLAGS = -march=armv7-a \
-            -mtune=cortex-a7 \
+ARM_FLAGS = -mcpu=cortex-a7 \
             -mfpu=neon-vfpv4 \
             -mfloat-abi=hard
 
@@ -49,12 +48,12 @@ demo_optimized: demo.c matrix_optimized.c
 timings: timing_baseline timing_osr timing_neon timing_optimized
 
 timing_baseline: timing.c not_optimized_fixedpoint.c
-	$(CC) $(CFLAGS) \
+	$(CC) $(CFLAGS) $(ARM_FLAGS)\
 		timing.c not_optimized_fixedpoint.c \
 		-o timing_baseline
 
 timing_osr: timing.c operator_strength_reduction.c
-	$(CC) $(CFLAGS) \
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
 		timing.c operator_strength_reduction.c \
 		-o timing_osr
 
@@ -76,12 +75,12 @@ timing_optimized: timing.c matrix_optimized.c
 benches: bench_baseline bench_osr bench_neon bench_optimized
 
 bench_baseline: bench.c not_optimized_fixedpoint.c
-	$(CC) $(CFLAGS) \
+	$(CC) $(CFLAGS) $(ARM_FLAGS)\
 		bench.c not_optimized_fixedpoint.c \
 		-o bench_baseline
 
 bench_osr: bench.c operator_strength_reduction.c
-	$(CC) $(CFLAGS) \
+	$(CC) $(CFLAGS) $(ARM_FLAGS) \
 		bench.c operator_strength_reduction.c \
 		-o bench_osr
 
