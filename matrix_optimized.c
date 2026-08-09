@@ -1,5 +1,5 @@
 /*
- * matrix_optimized.c
+ * matrix_optimigit test
  *
  * 8x8 matrix inversion by Gauss-Jordan elimination with partial
  * pivoting, using signed 16-bit Q4.12 fixed-point arithmetic.
