@@ -348,7 +348,6 @@ void create_identity(int16_t matrix[N][N])
 {
     int row;
 
-#pragma GCC unroll 8
     for (row = 0; row < N; row++) {
         vst1q_s16(matrix[row], vld1q_s16(identity_q12[row]));
     }
@@ -578,7 +577,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
      * its loads are plain VLD1 without an alignment qualifier; the
      * destination is aligned by construction.
      */
-#pragma GCC unroll 8
     for (row = 0; row < N; row++) {
         vst1q_s16(&augmented[row][0], vld1q_s16(input[row]));
         vst1q_s16(&augmented[row][N], vld1q_s16(identity_q12[row]));
@@ -602,7 +600,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
         pivot_row     = pivot_column;
         largest_value = fixed_absolute(augmented[pivot_column][pivot_column]);
 
-#pragma GCC unroll 8
         for (row = pivot_column + 1; row < N; row++) {
             current_value = fixed_absolute(augmented[row][pivot_column]);
 
@@ -655,7 +652,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
          */
         pivot_value = augmented[pivot_column][pivot_column];
 
-#pragma GCC unroll 16
         for (column = 0; column < AUGMENTED_N; column++) {
 
             if (column == pivot_column) {
@@ -698,7 +694,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
          */
         target_count = 0;
 
-#pragma GCC unroll 8
         for (row = 0; row < N; row++) {
             int16_t factor = augmented[row][pivot_column];
 
@@ -783,7 +778,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
              * can leave them at +/- 1 LSB, and the pivot search of
              * later columns depends on structural zeros being exact.
              */
-#pragma GCC unroll 7
             for (index = 0; index < target_count; index++) {
                 augmented[target_row[index]][pivot_column] = 0;
             }
@@ -804,7 +798,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
      * Write the inverse half of the augmented matrix back to the
      * caller: eight 128-bit loads and stores.
      */
-#pragma GCC unroll 8
     for (row = 0; row < N; row++) {
         vst1q_s16(inverse[row], vld1q_s16(&augmented[row][N]));
     }
@@ -843,7 +836,6 @@ void multiply_matrices(const int16_t first[N][N], const int16_t second[N][N], in
 
             sum = 0;
 
-#pragma GCC unroll 8
             for (k = 0; k < N; k++) {
                 sum += fixed_multiply(first_row[k], second[k][column]);
             }
@@ -871,7 +863,6 @@ int32_t matrix_infinity_norm(const int16_t matrix[N][N])
     int32_t row_sum;
     int32_t maximum_row_sum = 0;
 
-#pragma GCC unroll 8
     for (row = 0; row < N; row++) {
         int16x8_t values = vld1q_s16(matrix[row]);
 
