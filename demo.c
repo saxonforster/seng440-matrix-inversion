@@ -10,6 +10,9 @@
 #define MATRIX_SINGULAR  0
 #define MATRIX_OVERFLOW -1
 
+/* Magnitude bits available in signed 16-bit Q4.12, excluding the sign. */
+#define MATRIX_MAGNITUDE_BITS 15
+
 #ifndef IMPLEMENTATION_NAME
 #define IMPLEMENTATION_NAME "matrix implementation"
 #endif
@@ -22,6 +25,62 @@ extern void multiply_matrices(const int16_t first[N][N],
 extern int calculate_condition_number(const int16_t matrix[N][N],
                                       const int16_t inverse[N][N],
                                       int32_t *condition_number);
+
+int matrix_peak_magnitude_bits __attribute__((weak)) = -1;
+int matrix_predicted_bits      __attribute__((weak)) = -1;
+
+/*
+ * Reports the CLZ overflow analysis.
+ *
+ * Written to stderr, deliberately. The correctness tests compare the
+ * stdout of the four demo programs with diff, and only one of them
+ * produces these numbers. Keeping them on stderr means
+ *
+ *     ./demo_optimized > out.txt
+ *
+ * still yields a file that is byte-identical to the other three, while
+ *
+ *     ./demo_optimized 2> clz.txt
+ *
+ * captures the analysis on its own. Running the program with no
+ * redirection shows both.
+ */
+static void print_clz_analysis(int status)
+{
+    /* Keep stderr ordered after whatever stdout has produced so far. */
+    fflush(stdout);
+
+    if (matrix_peak_magnitude_bits < 0) {
+        fprintf(stderr,
+                "\nCLZ overflow analysis: not instrumented in this build.\n");
+        return;
+    }
+
+    fprintf(stderr, "\nCLZ overflow analysis\n");
+    fprintf(stderr, "  available magnitude bits (Q4.12) : %d\n",
+            MATRIX_MAGNITUDE_BITS);
+    fprintf(stderr, "  predicted peak, a priori         : %d\n",
+            matrix_predicted_bits);
+    fprintf(stderr, "  measured peak, actual            : %d\n",
+            matrix_peak_magnitude_bits);
+
+    if (status == MATRIX_SUCCESS) {
+        fprintf(stderr, "  headroom remaining               : %d bits\n",
+                MATRIX_MAGNITUDE_BITS - matrix_peak_magnitude_bits);
+    } else {
+        fprintf(stderr, "  headroom remaining               : none, "
+                        "inversion did not complete\n");
+    }
+
+    fprintf(stderr, "  prediction margin                : %+d bits\n",
+            matrix_predicted_bits - matrix_peak_magnitude_bits);
+
+    if (matrix_predicted_bits > MATRIX_MAGNITUDE_BITS
+            && status == MATRIX_SUCCESS) {
+        fprintf(stderr, "  note: CLZ predicted overflow that did not "
+                        "occur (conservative false alarm)\n");
+    }
+}
 
 static void print_fixed_value(int32_t value)
 {
@@ -101,11 +160,13 @@ int main(void)
 
     if (status == MATRIX_SINGULAR) {
         printf("\nThe matrix is singular at Q4.12 precision.\n");
+        print_clz_analysis(status);
         return 1;
     }
 
     if (status == MATRIX_OVERFLOW) {
         printf("\nQ4.12 overflow occurred during inversion.\n");
+        print_clz_analysis(status);
         return 1;
     }
 
@@ -118,12 +179,15 @@ int main(void)
 
     if (!calculate_condition_number(matrix, inverse, &condition_number)) {
         printf("\nCondition-number calculation overflowed.\n");
+        print_clz_analysis(status);
         return 1;
     }
 
     printf("\nInfinity-norm condition number: ");
     print_fixed_value(condition_number);
     printf("\n");
+
+    print_clz_analysis(status);
 
     return 0;
 }
