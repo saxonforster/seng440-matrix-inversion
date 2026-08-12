@@ -496,9 +496,9 @@ static inline int16x8_t neon_eliminate_row(int16x8_t target,
  * once per row, because reading a NEON lane into an ARM register
  * drains the pipeline on Cortex-A7.
  */
-static inline uint32_t reduce_overflow(int32x4_t first, int32x4_t second)
+static inline uint32_t reduce_overflow(int32x4_t overflow)
 {
-    uint32x4_t merged = vreinterpretq_u32_s32(vorrq_s32(first, second));
+    uint32x4_t merged = vreinterpretq_u32_s32(overflow);
     uint32x2_t pair   = vorr_u32(vget_low_u32(merged),
                                  vget_high_u32(merged));
 
@@ -567,8 +567,7 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
     int16_t   next_factor;
 
     /* Two accumulators so the halves do not serialize: OPTIMIZATION 9. */
-    int32x4_t overflow_a;
-    int32x4_t overflow_b;
+    int32x4_t overflow;
 
     /*
      * Build the augmented matrix. Sixteen 128-bit accesses replace the
@@ -706,8 +705,7 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
             target_count++;
         }
 
-        overflow_a = vdupq_n_s32(0);
-        overflow_b = vdupq_n_s32(0);
+        overflow = vdupq_n_s32(0);
 
         if (target_count > 0) {
             /*
@@ -753,10 +751,10 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
                  */
                 vst1q_s16(stage_pointer,
                           neon_eliminate_row(stage_low, pivot_low,
-                                             stage_factor, &overflow_a));
+                                             stage_factor, &overflow));
                 vst1q_s16(stage_pointer + N,
                           neon_eliminate_row(stage_high, pivot_high,
-                                             stage_factor, &overflow_b));
+                                             stage_factor, &overflow));
 
                 /* Rotate the pipeline registers. */
                 stage_pointer = next_pointer;
@@ -768,10 +766,10 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
             /* ---------------- EPILOGUE ---------------- */
             vst1q_s16(stage_pointer,
                       neon_eliminate_row(stage_low, pivot_low,
-                                         stage_factor, &overflow_a));
+                                         stage_factor, &overflow));
             vst1q_s16(stage_pointer + N,
                       neon_eliminate_row(stage_high, pivot_high,
-                                         stage_factor, &overflow_b));
+                                         stage_factor, &overflow));
 
             /*
              * Force the eliminated entries to exactly zero. Rounding
@@ -787,8 +785,7 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
              * entire pivot step. On overflow the whole result is
              * discarded, so deferring the test costs nothing.
              */
-            if (reduce_overflow(overflow_a, overflow_b)
-                    > (uint32_t)INT16_MAX) {
+            if (reduce_overflow(overflow) > (uint32_t)INT16_MAX) {
                 return MATRIX_OVERFLOW;
             }
         }
