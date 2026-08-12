@@ -1,5 +1,5 @@
 /*
- * matrix_optimigit test
+ * matrix_optimized.c
  *
  * 8x8 matrix inversion by Gauss-Jordan elimination with partial
  * pivoting, using signed 16-bit Q4.12 fixed-point arithmetic.
@@ -11,10 +11,12 @@
  * ====================================================================
  *
  * 1. OPERATOR STRENGTH REDUCTION            (fixed_divide, multiply_positive_q12)
- *    Multiplication and division by powers of two become shifts.
- *    Algebraic identities (x/1, x/-1, 0/x, x/x) short-circuit the
- *    hardware divide entirely. The sign-magnitude branches of the
- *    previous version are replaced by branch-free bit tricks.
+ *    Multiplication and division by powers of two become shifts where
+ *    doing so preserves the intended fixed-point behavior.
+ *    Algebraic fast paths for 0/x, x/1, and x/-1 avoid the hardware
+ *    divide entirely. An x/x shortcut is deliberately NOT used because
+ *    it would not match the baseline rounding behavior for negative x.
+ *    Several sign/magnitude operations are also implemented branch-free.
  *
  * 2. DATA LAYOUT: FUSED AUGMENTED MATRIX    (invert_matrix, "augmented")
  *    The working matrix and the inverse-in-progress are stored in one
@@ -40,7 +42,7 @@
  *    sign-fold/unfold dance that the previous version needed to
  *    reproduce round-half-away-from-zero is gone.
  *
- * 5. LOOP-INVARIANT CODE MOTION             (invert_matrix, "pivot_lo/pivot_hi")
+ * 5. LOOP-INVARIANT CODE MOTION             (invert_matrix, "pivot_low/pivot_high")
  *    The pivot row is loop-invariant across the seven eliminations
  *    that use it. It is loaded into two vector registers once per
  *    pivot column instead of once per target row: 112 loads per
@@ -52,11 +54,14 @@
  *    builds a dense worklist. The vector loop that follows has no
  *    data-dependent branches, which is what makes 7 and 8 possible.
  *
- * 7. LOOP UNROLLING
- *    - The 16 columns of an augmented row are processed as four
- *      independent 4-lane chains, manually interleaved.
- *    - The pivot search, the load/normalize/store passes and the
- *      row swap are fully unrolled (trip count is the constant 8).
+ * 7. INSTRUCTION-LEVEL PARALLELISM / FIXED-SIZE VECTOR WORK
+ *    - Each 8-element half-row is processed as two independent 4-lane
+ *      arithmetic chains inside neon_eliminate_row().
+ *    - The function is called once for each 8-element half of the
+ *      16-column augmented row, giving four 4-lane chains per row.
+ *    - Fixed-trip-count scalar loops remain written as loops; GCC may
+ *      choose to unroll some of them during optimization, but the source
+ *      does not manually fully unroll the pivot search or normalization.
  *
  * 8. SOFTWARE PIPELINING                    (invert_matrix, "PROLOGUE/KERNEL/EPILOGUE")
  *    The elimination loop is restructured so that iteration i's loads
@@ -66,18 +71,19 @@
  *    row i+1 with stage 2 (multiply/subtract/store) of row i hides
  *    that latency behind useful work.
  *
- * 9. HOISTED OVERFLOW TEST                  (invert_matrix, "overflow_a/overflow_b")
- *    Range checking accumulates in NEON registers for the whole pivot
- *    step and is read out ONCE per pivot column, not once per row.
- *    On Cortex-A7 a NEON-to-ARM register transfer (VMOV.32 rN, dM[x])
- *    stalls the pipeline for roughly 20 cycles, so this removes ~192
- *    such stalls per inversion. Two independent accumulators are used
- *    so the two halves of a row do not serialize on a single one.
+ * 9. HOISTED OVERFLOW TEST                  (invert_matrix, "overflow")
+ *    Range checking accumulates in one NEON vector register for the
+ *    whole pivot step and is reduced to a scalar once per pivot column,
+ *    rather than after every processed row. This reduces NEON-to-ARM
+ *    transfers on the timed elimination path.
  *
  * 10. VECTORIZED INFINITY NORM              (matrix_infinity_norm)
  *
- * Deliberately NOT used: CLZ, reciprocal approximation, floating-point
- * matrix arithmetic, 64-bit integer arithmetic.
+ * Deliberately NOT used: reciprocal approximation, floating-point
+ * matrix arithmetic, and 64-bit integer arithmetic.
+ *
+ * CLZ IS used by Optimization 11 for overflow-growth prediction and
+ * magnitude-bit measurement.
  *
  * ====================================================================
  * MEASURED EFFECT
@@ -96,17 +102,16 @@
  * Cortex-A7, removing 206 of them per inversion dominates everything
  * else in this file. The vector-op column is optimization 4.
  *
- * Neither column counts the scalar loads, stores and swap loops that
- * the previous version ran outside NEON and that optimizations 2 and 7
- * delete outright: 128 scalar loads plus 128 scalar stores for the two
- * copy nests, and up to 8 three-instruction scalar swaps per pivot
- * column.
+ * Neither column counts the scalar loads, stores, and swap loops
+ * removed by the fused augmented layout and NEON row operations:
+ * 128 scalar loads plus 128 scalar stores for the two copy nests,
+ * and up to 8 scalar element swaps per pivot column.
  *
- * Note on register pressure: the software pipeline holds 8 q-registers
- * live across the kernel (pivot pair, stage pair, next pair, two
- * accumulators) out of ARMv7's 16. Check the disassembly for VLDR/VSTR
- * spills in the loop body; if GCC spills, merging overflow_a and
- * overflow_b back into one accumulator is the cheapest thing to give up.
+ * Note on register pressure: the software pipeline keeps the pivot pair,
+ * current-stage pair, next-stage pair, and overflow accumulator live
+ * across the loop, in addition to temporaries inside the elimination
+ * kernel. Check the generated assembly for spills if evaluating the
+ * final register allocation on Cortex-A7.
  *
  * ====================================================================
  * NUMERICAL NOTE AND VERIFICATION
@@ -136,18 +141,19 @@
  * and it is switchable.
  */
 
+
 #include <stdio.h>
 #include <stdint.h>
 #include <limits.h>
 #include <arm_neon.h>
 
-#define N 8
+#define N 8   // Matrix dimension, 8x8 matrices
 
-/* Columns in the fused augmented matrix: [ working | inverse ]. */
-#define AUGMENTED_N (2 * N)
+#define AUGMENTED_N (2 * N)   //Columns in the fused augmented matrix: [ working | inverse ]
 
-#define FRACTION_BITS 12
-#define FIXED_ONE     (1 << FRACTION_BITS) /* 4096 */
+
+#define FRACTION_BITS 12   // Number of fractional bits in Q4.12 representation
+#define FIXED_ONE     (1 << FRACTION_BITS)   // 4096
 
 /*
  * Converts an integer constant to Q4.12.
@@ -157,9 +163,9 @@
 #define Q12_FROM_INT(value) \
     ((int16_t)((value) * FIXED_ONE))
 
-#define MATRIX_SUCCESS   1
-#define MATRIX_SINGULAR  0
-#define MATRIX_OVERFLOW -1
+#define MATRIX_SUCCESS   1   // Inversion successful
+#define MATRIX_SINGULAR  0   // Matrix has no usable pivot at the current precision
+#define MATRIX_OVERFLOW -1   // A result exceeded the int16_t Q4.12 range
 
 /*
  * Returns the absolute value of a 16-bit value as a 32-bit value.
@@ -491,10 +497,10 @@ static inline int16x8_t neon_eliminate_row(int16x8_t target,
 #endif /* EXACT_BASELINE_ROUNDING */
 
 /*
- * Horizontal reduction of the two overflow accumulators to a single
- * scalar. Called once per pivot column (OPTIMIZATION 9) rather than
- * once per row, because reading a NEON lane into an ARM register
- * drains the pipeline on Cortex-A7.
+ * Horizontally reduces the vector overflow accumulator to one scalar
+ * bit mask. Called once per pivot column (OPTIMIZATION 9), rather than
+ * once per processed row, so the elimination loop avoids repeated
+ * NEON-to-ARM scalar transfers.
  */
 static inline uint32_t reduce_overflow(int32x4_t overflow)
 {
@@ -507,8 +513,13 @@ static inline uint32_t reduce_overflow(int32x4_t overflow)
     return vget_lane_u32(pair, 0);
 }
 
-/* ==== OPTIMIZATION 11: CLZ overflow prediction and measurement ==== */
-
+/*
+ * 11. CLZ-BASED OVERFLOW PREDICTION
+ *     CLZ is used to estimate the bit growth caused by pivot-row
+ *     normalization and to measure the magnitude width of results.
+ *     The prediction is recorded for instrumentation; the exact
+ *     overflow check remains authoritative.
+ */
 #ifndef CLZ_INLINE_ASM
 #define CLZ_INLINE_ASM 0
 #endif
@@ -546,7 +557,7 @@ static inline int count_leading_zeros(uint32_t value)
 
     return (int)result;
 #else
-    return __builtin_clz(value);   /* one CLZ on Cortex-A7 */
+    return __builtin_clz(value);   // one CLZ on Cortex-A7
 #endif
 }
 
@@ -588,39 +599,40 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
     int16_t target_factor[N - 1];
     int     target_count;
 
-    int row;
-    int column;
-    int pivot_column;
-    int pivot_row;
+    int row;   // General row-loop index
+    int column;   // General column-loop index
+    int pivot_column;   // Column currently being reduced
+    int pivot_row;   // Row selected to provide pivot
     int index;
 
-    int32_t largest_value;
-    int32_t current_value;
-    int32_t division_result;
+    int32_t largest_value;   // Largest absolute pivot candidate found so far
+    int32_t current_value;   // Absolute value of the current pivot candidate
+    int32_t division_result;   // Temporary Q4.12 division result before narrowing
 
-    int16_t pivot_value;
+    int16_t pivot_value;   // Q4.12 value used to normalize the current pivot row
 
     /* Loaded once per pivot column: OPTIMIZATION 5. */
     int16x8_t pivot_low;
     int16x8_t pivot_high;
 
-    /* Software-pipeline stage registers: OPTIMIZATION 8. */
-    int16_t  *stage_pointer;
-    int16x8_t stage_low;
-    int16x8_t stage_high;
-    int16_t   stage_factor;
+    /* Current row held in the software-pipeline stage: OPTIMIZATION 8. */
+    int16_t  *stage_pointer;   // Start of the current augmented row
+    int16x8_t stage_low;   // Columns 0..7 of the current row
+    int16x8_t stage_high;   // Columns 8..15 of the current row
+    int16_t   stage_factor;   // Elimination factor for the current row
 
+    /* Next row is loaded early so its load latency overlaps current-row work. */
     int16_t  *next_pointer;
     int16x8_t next_low;
     int16x8_t next_high;
     int16_t   next_factor;
 
-    /* Two accumulators so the halves do not serialize: OPTIMIZATION 9. */
+    /* Accumulates folded magnitudes for the whole pivot step: OPTIMIZATION 9. */
     int32x4_t overflow;
 
-    int peak_bits;
-    int step_bits;
-    int growth_bits;
+    int peak_bits;   // Largest magnitude bit-width observed so far
+    int step_bits;   // Largest magnitude bit-width produced in this pivot step
+    int growth_bits;   // CLZ-based estimate of extra bits caused by normalization
 
     peak_bits = MATRIX_INPUT_BITS;
     matrix_peak_magnitude_bits = MATRIX_INPUT_BITS;
@@ -719,16 +731,12 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
         }
 
         /*
-         * --------------------------------------------------------
-         * Normalize the pivot row: divide all 16 augmented columns
-         * by the pivot.
-         *
          * This is the one part of the algorithm that cannot be
-         * vectorized, because NEON has no integer divide. What it
-         * gets instead is OPTIMIZATION 1 (most calls never reach the
-         * divider) and OPTIMIZATION 7 (fully unrolled, single base
-         * pointer, pivot held in a register).
-         * --------------------------------------------------------
+         * vectorized, because NEON has no integer divide. It instead
+         * benefits from OPTIMIZATION 1, where several common cases
+         * avoid the hardware divider entirely. The loop has a fixed
+         * trip count of 16, which also gives the compiler opportunities
+         * for additional optimization.
          */
         pivot_value = augmented[pivot_column][pivot_column];
 
@@ -901,8 +909,9 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
  * Verification only; not on the timed path. Left scalar because the
  * access pattern into `second` is column-strided and rounding is
  * applied per product, both of which make a vector form more
- * expensive than it is worth here. The k loop is unrolled and the row
- * base is hoisted.
+ * expensive than it is worth here. The first-row base is hoisted;
+ * the fixed eight-iteration k loop remains written explicitly as a loop
+ * and may be unrolled by the compiler at higher optimization levels.
  */
 void multiply_matrices(const int16_t first[N][N], const int16_t second[N][N], int32_t result[N][N])
 {

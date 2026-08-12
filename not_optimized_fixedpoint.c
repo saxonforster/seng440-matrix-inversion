@@ -18,10 +18,10 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#define N 8
+#define N 8   // Matrix dimension, 8x8 matrices
 
-#define FRACTION_BITS 12
-#define FIXED_ONE     (1 << FRACTION_BITS) /* 4096 */
+#define FRACTION_BITS 12   // Number of fractional bits in Q4.12 representation
+#define FIXED_ONE     (1 << FRACTION_BITS)   //4096 
 
 /*
  * Converts an integer constant to Q4.12.
@@ -31,9 +31,9 @@
 #define Q12_FROM_INT(value) \
     ((int16_t)((value) * FIXED_ONE))
 
-#define MATRIX_SUCCESS   1
-#define MATRIX_SINGULAR  0
-#define MATRIX_OVERFLOW -1
+#define MATRIX_SUCCESS   1  /* Inversion completed successfully. */
+#define MATRIX_SINGULAR  0  /* Matrix has no usable pivot at the current precision. */
+#define MATRIX_OVERFLOW -1  /* An intermediate/result exceeded the int16_t Q4.12 range. */
 
 /*
  * Returns the absolute value of a 16-bit value as a 32-bit value.
@@ -213,20 +213,20 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
 {
     int16_t working[N][N];
 
-    int row;
-    int column;
-    int pivot_column;
-    int pivot_row;
-    int other_row;
+    int row;   // General row-loop index
+    int column;   // General column-loop index
+    int pivot_column;   // Column currently being reduced
+    int pivot_row;   // Row selected to provide pivot
+    int other_row;   // Row currently being cleared during elimination
 
-    int32_t largest_value;
-    int32_t current_value;
-    int32_t division_result;
-    int32_t product;
-    int32_t updated_value;
+    int32_t largest_value;   // Largest absolute pivot candidate found so far
+    int32_t current_value;   // Absolute value of the current pivot candidate
+    int32_t division_result;   // Temporary Q4.12 division result before narrowing
+    int32_t product;   // Temporary Q4.12 multiplication result
+    int32_t updated_value;   // Element value after subtracting the pivot-row contribution
 
-    int16_t pivot_value;
-    int16_t elimination_factor;
+    int16_t pivot_value;   // Q4.12 value used to normalize the current pivot row
+    int16_t elimination_factor;   // Value used to eliminate the current pivot-column entry
 
     /*
      * Copy the input matrix so that the original is preserved.
@@ -324,6 +324,8 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
 
         /*
          * Eliminate the pivot-column value from every other row.
+         * The same row operation is applied to both working and inverse
+         * so that [A | I] is transformed toward [I | A^-1].
          */
         for (other_row = 0; other_row < N; other_row++) {
 
