@@ -26,11 +26,57 @@ extern int calculate_condition_number(const int16_t matrix[N][N],
                                       const int16_t inverse[N][N],
                                       int32_t *condition_number);
 
+
 int matrix_peak_magnitude_bits __attribute__((weak)) = -1;
 int matrix_predicted_bits      __attribute__((weak)) = -1;
 
 /*
- * Reports the CLZ overflow analysis.
+ * ====================================================================
+ * TESTBENCH
+ * ====================================================================
+ *
+ * The project requires a well-conditioned and an ill-conditioned matrix,
+ * and the required precision for each.
+ *
+ * CASE 1: symmetric tridiagonal, diagonal 4.0, off-diagonal 1.0.
+ *     Strongly diagonally dominant, kappa_inf = 2.98. Representative of
+ *     the well-behaved end of the input space.
+ *
+ * CASE 2: dense random matrix, elements in [-1.0, +1.0], selected for
+ *     kappa_inf = 79.8. This exceeds the validated operating range of
+ *     kappa <= 32 and inverts with ZERO remaining magnitude bits, which
+ *     is what makes it useful: it sits exactly at the precision limit of
+ *     Q4.12 rather than comfortably inside it. Largest element of the
+ *     inverse is 4.74, against a format maximum of 7.9998.
+ *
+ * Both matrices produce identical results under round-half-away-from-
+ * zero and round-half-up, so all four implementations agree on both.
+ */
+static const int16_t well_conditioned[N][N] = {
+    {Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0, 0, 0, 0},
+    {Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0, 0, 0},
+    {0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0, 0},
+    {0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0},
+    {0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0},
+    {0, 0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0},
+    {0, 0, 0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1)},
+    {0, 0, 0, 0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4)}
+};
+
+/* Raw Q4.12; divide by 4096 for the real value. */
+static const int16_t ill_conditioned[N][N] = {
+    { -2109,    269,   2286,    613,  -1492,  -3384,  -2401,  -3622},
+    {  3484,  -1508,   3455,  -3649,  -2089,   1881,    -30,   -317},
+    { -3137,  -1310,   -894,   -250,   -746,   1356,  -4082,  -3411},
+    {  2786,   3949,  -3225,  -3540,   1164,   1528,  -3377,  -2426},
+    {  -570,   1328,  -1668,   1791,   1367,    -24,   3679,   2271},
+    { -3477,   -343,   3404,   3241,   -802,  -3484,   2318,  -2730},
+    {  3058,  -2340,    573,  -2787,   2097,    243,   -334,   -986},
+    { -1093,  -2904,   3568,  -2869,   3458,   -303,   1563,   2490}
+};
+
+/*
+ * Reports the CLZ overflow analysis for the case just run.
  *
  * Written to stderr, deliberately. The correctness tests compare the
  * stdout of the four demo programs with diff, and only one of them
@@ -42,31 +88,34 @@ int matrix_predicted_bits      __attribute__((weak)) = -1;
  *
  *     ./demo_optimized 2> clz.txt
  *
- * captures the analysis on its own. Running the program with no
- * redirection shows both.
+ * captures the analysis on its own.
  */
-static void print_clz_analysis(int status)
+static void print_clz_analysis(const char *label, int status)
 {
+    int headroom;
+
     /* Keep stderr ordered after whatever stdout has produced so far. */
     fflush(stdout);
 
     if (matrix_peak_magnitude_bits < 0) {
-        fprintf(stderr,
-                "\nCLZ overflow analysis: not instrumented in this build.\n");
+        fprintf(stderr, "\n[%s] CLZ overflow analysis: not instrumented "
+                        "in this build.\n", label);
         return;
     }
 
-    fprintf(stderr, "\nCLZ overflow analysis\n");
+    headroom = MATRIX_MAGNITUDE_BITS - matrix_peak_magnitude_bits;
+
+    fprintf(stderr, "\n[%s] CLZ overflow analysis\n", label);
     fprintf(stderr, "  available magnitude bits (Q4.12) : %d\n",
             MATRIX_MAGNITUDE_BITS);
-    fprintf(stderr, "  predicted peak, a priori         : %d\n",
+    fprintf(stderr, "  predicted peak,         : %d\n",
             matrix_predicted_bits);
-    fprintf(stderr, "  measured peak, actual            : %d\n",
+    fprintf(stderr, "  measured peak,          : %d\n",
             matrix_peak_magnitude_bits);
 
     if (status == MATRIX_SUCCESS) {
-        fprintf(stderr, "  headroom remaining               : %d bits\n",
-                MATRIX_MAGNITUDE_BITS - matrix_peak_magnitude_bits);
+        fprintf(stderr, "  headroom remaining               : %d bit%s\n",
+                headroom, headroom == 1 ? "" : "s");
     } else {
         fprintf(stderr, "  headroom remaining               : none, "
                         "inversion did not complete\n");
@@ -78,7 +127,7 @@ static void print_clz_analysis(int status)
     if (matrix_predicted_bits > MATRIX_MAGNITUDE_BITS
             && status == MATRIX_SUCCESS) {
         fprintf(stderr, "  note: CLZ predicted overflow that did not "
-                        "occur (conservative false alarm)\n");
+                        "occur\n");
     }
 }
 
@@ -134,39 +183,37 @@ static void print_wide_matrix(const int32_t matrix[N][N])
     }
 }
 
-int main(void)
+/*
+ * Inverts one testbench matrix and reports everything about it.
+ *
+ * Returns 0 on success, 1 if the inversion or the condition-number
+ * calculation failed.
+ */
+static int run_case(const char *label, const int16_t matrix[N][N])
 {
-    static const int16_t matrix[N][N] = {
-        {Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0, 0, 0, 0},
-        {Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0, 0, 0},
-        {0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0, 0},
-        {0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0, 0},
-        {0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0, 0},
-        {0, 0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1), 0},
-        {0, 0, 0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4), Q12_FROM_INT(1)},
-        {0, 0, 0, 0, 0, 0, Q12_FROM_INT(1), Q12_FROM_INT(4)}
-    };
-
     int16_t inverse[N][N];
     int32_t verification[N][N];
     int32_t condition_number;
     int status;
 
-    printf("%s\n\n", IMPLEMENTATION_NAME);
+    printf("====================================================\n");
+    printf("%s\n", label);
+    printf("====================================================\n\n");
+
     printf("Original Q4.12 matrix A:\n\n");
     print_matrix(matrix);
 
     status = invert_matrix(matrix, inverse);
 
     if (status == MATRIX_SINGULAR) {
-        printf("\nThe matrix is singular at Q4.12 precision.\n");
-        print_clz_analysis(status);
+        printf("\nThe matrix is singular at Q4.12 precision.\n\n");
+        print_clz_analysis(label, status);
         return 1;
     }
 
     if (status == MATRIX_OVERFLOW) {
-        printf("\nQ4.12 overflow occurred during inversion.\n");
-        print_clz_analysis(status);
+        printf("\nQ4.12 overflow occurred during inversion.\n\n");
+        print_clz_analysis(label, status);
         return 1;
     }
 
@@ -178,16 +225,29 @@ int main(void)
     print_wide_matrix(verification);
 
     if (!calculate_condition_number(matrix, inverse, &condition_number)) {
-        printf("\nCondition-number calculation overflowed.\n");
-        print_clz_analysis(status);
+        printf("\nCondition-number calculation overflowed.\n\n");
+        print_clz_analysis(label, status);
         return 1;
     }
 
     printf("\nInfinity-norm condition number: ");
     print_fixed_value(condition_number);
-    printf("\n");
+    printf("\n\n");
 
-    print_clz_analysis(status);
+    print_clz_analysis(label, status);
 
     return 0;
+}
+
+int main(void)
+{
+    int failures = 0;
+
+    printf("%s\n\n", IMPLEMENTATION_NAME);
+
+    failures += run_case("Case 1: well-conditioned", well_conditioned);
+    printf("\n");
+    failures += run_case("Case 2: ill-conditioned", ill_conditioned);
+
+    return failures != 0;
 }
