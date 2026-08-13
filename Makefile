@@ -21,12 +21,12 @@ all: demos timings benches
 demos: demo_baseline demo_osr demo_neon demo_optimized
 
 demo_baseline: demo.c not_optimized_fixedpoint.c
-	$(CC) $(CFLAGS) \
+	$(CC) $(CFLAGS) $(ARM_FLAGS)\
 		demo.c not_optimized_fixedpoint.c \
 		-o demo_baseline
 
 demo_osr: demo.c operator_strength_reduction.c
-	$(CC) $(CFLAGS) \
+	$(CC) $(CFLAGS) $(ARM_FLAGS)\
 		demo.c operator_strength_reduction.c \
 		-o demo_osr
 
