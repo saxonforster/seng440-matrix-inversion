@@ -86,12 +86,6 @@ int32_t fixed_multiply(int16_t first, int16_t second)
 
     /*
      * int16_t operands are promoted to int32_t.
-     *
-     * The largest possible magnitude is approximately:
-     *
-     *     32768 * 32768 = 1,073,741,824
-     *
-     * which fits in signed 32-bit storage.
      */
     product = (int32_t)first * (int32_t)second;
 
@@ -337,9 +331,6 @@ int invert_matrix(const int16_t input[N][N], int16_t inverse[N][N])
 
             /*
              * Skip the row if this column is already zero.
-             *
-             * This is only a correctness-preserving check, not a
-             * performance optimization.
              */
             if (elimination_factor == 0) {
                 continue;
