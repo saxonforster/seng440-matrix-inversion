@@ -80,15 +80,7 @@ static const int16_t ill_conditioned[N][N] = {
  *
  * Written to stderr, deliberately. The correctness tests compare the
  * stdout of the four demo programs with diff, and only one of them
- * produces these numbers. Keeping them on stderr means
- *
- *     ./demo_optimized > out.txt
- *
- * still yields a file that is byte-identical to the other three, while
- *
- *     ./demo_optimized 2> clz.txt
- *
- * captures the analysis on its own.
+ * produces these numbers.
  */
 static void print_clz_analysis(const char *label, int status)
 {
